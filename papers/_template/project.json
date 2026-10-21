@@ -1,0 +1,19 @@
+{
+  "journal": {
+    "name": "",
+    "guidelines_url": "",
+    "article_type": ""
+  },
+  "topic": null,
+  "keywords": [],
+  "constraints": {
+    "open_access": null,
+    "indexing": null,
+    "deadline": null,
+    "max_apc": null
+  },
+  "authors": [],
+  "intake_confirmed": false,
+  "intake_confirmed_at": null,
+  "intake_confirmed_by": null
+}

@@ -1,0 +1,35 @@
+\documentclass[11pt]{article}
+\usepackage[margin=2.5cm]{geometry}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\newenvironment{point}[1]{\par\medskip\noindent\textbf{#1}\par\begin{quote}\itshape}{\end{quote}}
+\newenvironment{reply}{\par\noindent\textbf{Response.}\ }{\par}
+\newcommand{\change}[1]{\par\noindent\textbf{Change.}\ #1\par}
+
+\begin{document}
+\noindent Dear Editor,\par\medskip
+\noindent We thank the editor and the reviewers for their careful reading of our manuscript
+``[TITLE]'' ([MANUSCRIPT ID]). Below we reply to every comment point by point; reviewer comments are
+quoted verbatim in italics. Page and line numbers refer to the revised manuscript; a version with
+tracked changes is attached.
+
+\section*{Editor}
+\begin{point}{E.1}
+[verbatim comment]
+\end{point}
+\begin{reply}
+[response]
+\end{reply}
+\change{[what changed, where: Section x, p.\ y, lines a--b]}
+
+\section*{Reviewer 1}
+\begin{point}{R1.1}
+[verbatim comment]
+\end{point}
+\begin{reply}
+[response]
+\end{reply}
+\change{[...]}
+
+\bigskip\noindent Sincerely,\par\noindent [AUTHOR TO PROVIDE: corresponding author]
+\end{document}

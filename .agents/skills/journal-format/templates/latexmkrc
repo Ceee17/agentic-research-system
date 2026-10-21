@@ -1,0 +1,5 @@
+# Copy to paper/latexmkrc only if the template needs a non-pdflatex engine or biber.
+# ./ra compile passes -outdir=build itself.
+$pdf_mode = 1;          # 1 = pdflatex, 4 = lualatex, 5 = xelatex
+$bibtex_use = 2;        # run bibtex/biber when needed; clean up .bbl
+# $biber = 'biber %O %S';   # uncomment for biblatex templates

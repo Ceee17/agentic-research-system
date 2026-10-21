@@ -1,0 +1,46 @@
+# ==============================================================================
+# Research Paper Agent — Framework Git Ignore
+# ==============================================================================
+
+# Python environment and runtime caches
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Workspace internal state (active paper tracking, session bindings, API cache)
+.ra/
+
+# Local harness overrides and secrets
+.claude/settings.local.json
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# LaTeX build artifacts and temporary files
+*.aux
+*.bbl
+*.blg
+*.log
+*.out
+*.toc
+*.synctex.gz
+*.fls
+*.fdb_latexmk
+
+# ------------------------------------------------------------------------------
+# Paper isolation: Do NOT commit active or generated research papers
+# ------------------------------------------------------------------------------
+# All generated research papers live in their own isolated git repositories.
+# When publishing this framework, ignore all active papers and keep only the template:
+papers/*/
+!papers/_template/
+!papers/_template/**
+
+# Explicit safeguard for existing papers:
+papers/grover/
+papers/ai-chatbot-education/
+papers/llm-education-agents/

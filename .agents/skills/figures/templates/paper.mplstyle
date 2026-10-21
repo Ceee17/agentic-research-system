@@ -1,0 +1,24 @@
+# Journal-figure defaults: single-column width (~3.4 in), vector output, colour-blind-safe cycle.
+figure.figsize: 3.4, 2.4
+figure.dpi: 150
+savefig.format: pdf
+savefig.bbox: tight
+savefig.pad_inches: 0.02
+pdf.fonttype: 42
+ps.fonttype: 42
+font.family: serif
+font.size: 8
+axes.labelsize: 8
+axes.titlesize: 8
+legend.fontsize: 7
+xtick.labelsize: 7
+ytick.labelsize: 7
+axes.linewidth: 0.6
+lines.linewidth: 1.2
+lines.markersize: 3.5
+axes.spines.top: False
+axes.spines.right: False
+axes.grid: False
+legend.frameon: False
+axes.prop_cycle: cycler('color', ['0072B2', 'D55E00', '009E73', 'CC79A7', 'E69F00', '56B4E9', 'F0E442', '000000'])
+mathtext.fontset: cm

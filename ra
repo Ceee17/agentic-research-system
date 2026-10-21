@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Workspace command launcher:  ./ra <command> [args...]      (./ra help)
+# Finds a Python >= 3.9 (project .venv first, then python3/python, then uv) and runs scripts/cli.py.
+set -u
+RA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PY=()
+if [ -x "$RA_ROOT/.venv/bin/python" ]; then
+  PY=("$RA_ROOT/.venv/bin/python")
+elif [ -x "$RA_ROOT/.venv/Scripts/python.exe" ]; then
+  PY=("$RA_ROOT/.venv/Scripts/python.exe")
+else
+  for c in python3 python; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' >/dev/null 2>&1; then
+      PY=("$c"); break
+    fi
+  done
+  if [ ${#PY[@]} -eq 0 ] && command -v uv >/dev/null 2>&1; then
+    PY=(uv run --no-project --quiet python)
+  fi
+fi
+if [ ${#PY[@]} -eq 0 ]; then
+  echo "ra: no Python >= 3.9 found. Run scripts/setup.sh (or install Python or uv)." >&2
+  [ "${1:-}" = "hook" ] && exit 2   # guardrails fail closed
+  exit 127
+fi
+export PYTHONUTF8=1 PYTHONIOENCODING=utf-8
+# On Windows (Git Bash/MSYS) hand Python a native path; wrappers do not always convert /c/... paths.
+if command -v cygpath >/dev/null 2>&1; then RA_NATIVE="$(cygpath -m "$RA_ROOT")"; else RA_NATIVE="$RA_ROOT"; fi
+exec "${PY[@]}" "$RA_NATIVE/scripts/cli.py" "$@"

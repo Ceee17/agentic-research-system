@@ -1,0 +1,720 @@
+"""Claude Code hook handlers: the workspace's hard guardrails.
+
+Invoked from .claude/settings.json as `bash "$CLAUDE_PROJECT_DIR/ra" hook <event>` with the
+hook payload on stdin. Exit code 2 blocks the action and shows stderr to Claude.
+
+  pre-edit       PreToolUse  Edit|Write|MultiEdit|NotebookEdit
+  pre-read       PreToolUse  Read|Glob|Grep|NotebookRead    (papers are isolated from each other)
+  pre-bash       PreToolUse  Bash|PowerShell                (shell bypasses of the rules)
+  pre-skill      PreToolUse  Skill                          (active paper, intake + gate prerequisites)
+  post-edit      PostToolUse Edit|Write|MultiEdit           (verify_bib + latexmk + hard rules on paper edits)
+  prompt         UserPromptSubmit                           (human PAPER / NEW PAPER / APPROVE / REJECT)
+  session-start  SessionStart                               (status into context, session binding)
+  stop           Stop                                       (LOCKED-region tamper backstop)
+
+Layout: framework at the workspace root (human-owned); one folder per paper in papers/<name>/.
+Only the ACTIVE paper (chosen by the human) can be read or written, and one conversation works
+on one paper (session binding in ra/papers.py).
+"""
+from __future__ import annotations
+
+import fnmatch
+import json
+import os
+import re
+import sys
+import traceback
+
+from . import core, papers, pipeline, rules, shadow, tex
+
+PREFIX = "[workspace guard] BLOCKED: "
+STAGE_SKILLS = {d["skill"] for d in pipeline.STAGE_DEFS.values()}
+POST_GATE1_SKILLS = {"theory-experiment", "figures", "drafting", "citation-verify", "journal-format", "self-review"}
+POST_GATE2_SKILLS = {"revision"}
+
+FRAMEWORK_PROTECTED = [
+    (".claude/*", "workspace settings, hooks, skills and agents are human-owned."),
+    ("scripts/*", "workspace tooling (including these guardrails) is human-owned; experiment code goes in "
+                  "papers/<paper>/experiments/, figure code in papers/<paper>/figures/scripts/."),
+    ("CLAUDE.md", "process instructions are human-owned."),
+    ("README.md", "workspace documentation is human-owned."),
+    ("opencode.json", "the OpenCode configuration is human-owned."),
+    ("AGENTS.md", "the workspace entry point is human-owned."),
+    ("GEMINI.md", "the Gemini / Antigravity entry point is human-owned."),
+    (".opencode/*", "OpenCode plugins, agents and commands are human-owned."),
+    (".agents/*", "Antigravity settings, hooks, skills and agents are human-owned."),
+    ("ra", "the workspace launcher is human-owned."),
+    ("requirements.txt", "the Python environment is human-owned."),
+    (".ra/*", "internal workspace state (active paper, sessions, API cache)."),
+    (".venv/*", "the Python environment is human-owned."),
+]
+# what `MAINTENANCE ON` (human, chat) unlocks for one conversation; runtime state and papers stay guarded
+FRAMEWORK_EDITABLE = [".claude/*", "scripts/*", "CLAUDE.md", "README.md", "opencode.json", "AGENTS.md",
+                      "GEMINI.md", ".opencode/*", ".agents/*", "ra", "requirements.txt", ".gitignore", ".gitattributes"]
+MAINT_HINT = (" (Human: to change the framework, type `MAINTENANCE ON` in chat; it unlocks framework files for "
+              "this conversation for 2 hours, `MAINTENANCE OFF` ends it.)")
+_FIG = "Figures are generated from saved scripts via `./ra figs` (no hand-made or AI-generated images)."
+PAPER_PROTECTED = [
+    ("state.json", "pipeline state changes only through `./ra state ...`; gate approvals are human-only."),
+    ("*.bib", "BibTeX is fetched from Crossref/arXiv/Semantic Scholar with `./ra fetch-bib add <DOI|arXiv>`; "
+              "it is never written by hand or from memory."),
+    ("paper/references.verified.json", "the citation ledger is written only by `./ra fetch-bib`."),
+    ("results/*", "results/ is produced only by executing code with `./ra run` (every number must trace to a run)."),
+    ("paper/generated/*", "generated file; regenerate with `./ra results-tex` instead of editing."),
+    ("paper/build/*", "build output produced by latexmk."),
+    ("exports/*", "exports are built by `./ra export` (Overleaf zip + PDF)."),
+    ("figures/*.pdf", _FIG), ("figures/*.png", _FIG), ("figures/*.svg", _FIG), ("figures/*.eps", _FIG),
+    ("figures/*.jpg", _FIG), ("figures/*.jpeg", _FIG), ("figures/manifest.json", _FIG),
+    ("templates/*", "official journal templates stay pristine (download with `./ra template fetch`); "
+                    "adapt them inside paper/."),
+    ("reviews/external/*", "real reviewer comments are provided by the human and must never be altered."),
+    ("feedback/*", "feedback/ is the human's inbox; process it with `./ra feedback ...` / `./ra edits ...`."),
+    (".ra/*", "internal per-paper state."),
+    (".git/*", "the paper's git repository is managed by `./ra`."),
+    (".gitignore", "the paper repository settings are human-owned."),
+    ("CLAUDE.md", "the paper folder's pointer file is generated by the workspace."),
+]
+PIPELINE_DIRS = ("literature/", "experiments/", "results/", "figures/", "paper/", "reviews/", "gates/")
+INTAKE_ALLOWED = ("gates/gate0_intake.md", "literature/topic-fit.md", "literature/journal-")
+GATE1_DIRS = ("experiments/", "figures/", "paper/")
+GATE2_DIRS = ("reviews/response/",)
+AI_FILE_RE = re.compile(r"(^|/)[^/]*(ai[-_]?(disclosure|statement|declaration|use)|generative[-_]ai)[^/]*$", re.I)
+
+
+def deny(msg: str) -> int:
+    print(PREFIX + msg, file=sys.stderr)
+    return 2
+
+
+def _context(event: str, text: str) -> None:
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": text}}))
+
+
+def _locate(fp: str, cwd: str | None = None) -> tuple[str | None, str | None, str | None]:
+    """(workspace-relative path, paper slug, path relative to that paper) for a tool path."""
+    p = fp if os.path.isabs(fp) else os.path.join(cwd or str(core.ws()), fp)
+    wr = core.wrel(p)
+    if wr is None:
+        return None, None, None
+    slug = core.paper_of(p)
+    r = None
+    if slug:
+        prefix = f"papers/{slug}/"
+        r = wr[len(prefix):] if wr.startswith(prefix) else ""
+    return wr, slug, r
+
+
+def _paper_gate(slug: str | None, sid: str | None, what: str) -> str | None:
+    """Why the agent may not touch `what` in paper `slug` (None = allowed)."""
+    active = core.active_paper()
+    if not active:
+        return f"{what}: {core.no_paper_message()}"
+    if slug is None:
+        return f"{what}: papers/ holds one folder per paper; work inside papers/{active}/ only."
+    if slug != active:
+        return (f"{what} belongs to paper '{slug}', but the active paper is '{active}'. Papers are isolated: never "
+                "read, search, reuse or cite another paper's files.")
+    return papers.bind_check(sid)
+
+
+# ================================================================== edits
+def _apply(cur: str | None, old, new, replace_all) -> str | None:
+    cur = cur or ""
+    old, new = core.norm_newlines(old or ""), core.norm_newlines(new or "")
+    if old == "":
+        return new if cur == "" else None
+    if old not in cur:
+        return None
+    return cur.replace(old, new) if replace_all else cur.replace(old, new, 1)
+
+
+def simulate(tool: str, ti: dict, cur: str | None) -> str | None:
+    """Content of the file after the tool call, or None if it cannot be determined."""
+    if tool == "Write":
+        return core.norm_newlines(ti.get("content") or "")
+    if tool == "Edit":
+        return _apply(cur, ti.get("old_string"), ti.get("new_string"), ti.get("replace_all"))
+    if tool == "MultiEdit":
+        text = cur
+        for e in ti.get("edits") or []:
+            text = _apply(text, e.get("old_string"), e.get("new_string"), e.get("replace_all"))
+            if text is None:
+                return None
+        return text
+    return None
+
+
+def _check_project_json(cur: str | None, new: str | None) -> int:
+    if new is None:
+        return 0
+    try:
+        newj = json.loads(new)
+    except json.JSONDecodeError as e:
+        return deny(f"project.json must remain valid JSON ({e}).")
+    oldj = json.loads(cur) if cur and cur.strip() else {}
+    if newj.get("intake_confirmed") is True and oldj.get("intake_confirmed") is not True:
+        return deny("only the human confirms intake. Show the summary (gates/gate0_intake.md) and ask the human to "
+                    "type `APPROVE intake` in chat (or run `./ra state approve intake` in a terminal).")
+    for k in ("intake_confirmed_at", "intake_confirmed_by"):
+        if newj.get(k) != oldj.get(k) and newj.get(k) is not None:
+            return deny(f"`{k}` is set only by the human approval channel.")
+    if oldj.get("intake_confirmed") is True and newj.get("intake_confirmed") is True \
+            and newj.get("journal") != oldj.get("journal"):
+        return deny("the journal cannot change while intake is confirmed. A journal change is a structural "
+                    "'journal' scope item: `./ra state stale --scope journal --reason ...` first, then re-run intake.")
+    return 0
+
+
+def pre_edit(data: dict) -> int:
+    ti = data.get("tool_input") or {}
+    fp = ti.get("file_path") or ti.get("notebook_path")
+    if not fp:
+        return 0
+    wr, slug, r = _locate(fp, data.get("cwd"))
+    if wr is None:
+        return 0
+    if wr == "papers" or wr.startswith("papers/"):
+        why = _paper_gate(slug, data.get("session_id"), wr)
+        if why:
+            return deny(why)
+        if not r:
+            return deny(f"{wr}: write files inside the paper folder, not the folder itself.")
+        return _pre_edit_paper(data.get("tool_name") or "", ti, r)
+    if any(fnmatch.fnmatch(wr, p) for p in FRAMEWORK_EDITABLE) and papers.maintenance_until(data.get("session_id")):
+        return 0                                  # human switched on MAINTENANCE for this conversation
+    for pat, why in FRAMEWORK_PROTECTED:
+        if fnmatch.fnmatch(wr, pat):
+            return deny(f"{wr}: {why}" + (MAINT_HINT if any(fnmatch.fnmatch(wr, p) for p in FRAMEWORK_EDITABLE)
+                                          else ""))
+    active = core.active_paper()
+    return deny(f"{wr}: the workspace root holds the shared framework only. Paper work goes in "
+                f"papers/{active or '<active paper>'}/.")
+
+
+def _pre_edit_paper(tool: str, ti: dict, r: str) -> int:
+    for pat, why in PAPER_PROTECTED:
+        if fnmatch.fnmatch(r, pat):
+            return deny(f"{r}: {why}")
+
+    if r.startswith(PIPELINE_DIRS):
+        miss = pipeline.intake_missing()
+        if miss:
+            return deny(f"{r}: intake is incomplete (missing {', '.join(miss)}). Run the intake skill and do "
+                        "nothing else until the human has answered.")
+        if not pipeline.intake_confirmed() and not r.startswith(INTAKE_ALLOWED):
+            return deny(f"{r}: intake is not confirmed by the human yet (gate0). Only intake outputs may be written.")
+        st = pipeline.load_state()
+        if r.startswith(GATE1_DIRS) and not pipeline.gate_ok(st, "gate1_topic"):
+            return deny(f"{r}: Gate 1 (topic) has not been approved by the human; theory, figures and paper "
+                        "work cannot start.")
+        if r.startswith(GATE2_DIRS) and not pipeline.gate_ok(st, "gate2_draft"):
+            return deny(f"{r}: Gate 2 (draft) has not been approved; revision work cannot start.")
+
+    cur = core.read_text(core.path(r))
+    cur = core.norm_newlines(cur) if cur is not None else None
+    new = simulate(tool, ti, cur)
+
+    if r.startswith(("paper/", "reviews/response/")) and cur is None and AI_FILE_RE.search(r):
+        return deny(f"{r}: hard rule - no AI-use / AI-assistance statement is written for the paper (the author "
+                    "handles any disclosure the journal requires).")
+
+    if r == "project.json":
+        return _check_project_json(cur, new)
+
+    if r in ("decisions.md", "style-guide.md"):
+        units = tex.human_protected_units(cur or "")
+        if units and new is None:
+            return deny(f"{r}: cannot verify that `(human)` entries are preserved; use an exact Edit.")
+        gone = [u for u in units if u not in (new or "")]
+        if gone:
+            return deny(f"{r}: entries marked (human) can never be changed or removed by the agent "
+                        f"(affected: {gone[0].splitlines()[0][:90]!r}). Add a new entry instead.")
+        return 0
+
+    if r.endswith(".tex"):
+        old_blocks = tex.locked_blocks(cur)
+        new_blocks = tex.locked_blocks(new) if new is not None else None
+        restoring = (new_blocks is not None and new_blocks != old_blocks and tool != "Write"
+                     and new_blocks == shadow.snapshot_blocks(r))
+        if shadow.tracked(r) and cur is not None and not restoring and shadow.has_unregistered_change(r):
+            return deny(f"{r} contains human edits you have not registered yet. Never overwrite them: run the "
+                        "apply-feedback skill (`./ra edits detect`, then `./ra edits accept`) before editing this file.")
+        if new is None:
+            if old_blocks:
+                return deny(f"{r}: cannot verify the edit against LOCKED regions (old_string not found verbatim).")
+            return 0
+        if new_blocks != old_blocks and not restoring:
+            return deny(f"{r}: the edit would change, add or remove a `% LOCKED-START`/`% LOCKED-END` region. "
+                        "Locked text is human-owned; leave it byte-identical (edit only outside the markers).")
+        if tex.count_agent_marks(new) > tex.count_agent_marks(cur):
+            return deny(f"{r}: `% @agent` comments are a human-only channel; do not add them.")
+        if new.count(tex.NUM_OK_MARK) > (cur or "").count(tex.NUM_OK_MARK):
+            return deny(f"{r}: `% @num-ok` exemptions can only be added by the human.")
+        if r.startswith(("paper/", "reviews/response/")):
+            if len(rules.ai_statement_hits(new)) > len(rules.ai_statement_hits(cur)):
+                return deny(f"{r}: hard rule - no AI-use / AI-assistance statement or AI attribution in the paper "
+                            "(the author handles any disclosure the journal requires).")
+        if r.startswith("paper/"):
+            added = [v for v in rules.abstract_violations({r: new}) if v not in set(rules.abstract_violations())]
+            if added:
+                return deny(f"{r}: hard rule - no formulas in the abstract, strictly. This edit adds: "
+                            + "; ".join(added[:6]) + ". Say it in words.")
+    return 0
+
+
+def post_edit(data: dict) -> int:
+    from . import bibcheck, latex
+    ti = data.get("tool_input") or {}
+    fp = ti.get("file_path")
+    if not fp:
+        return 0
+    wr, slug, r = _locate(fp, data.get("cwd"))
+    if not r or slug != core.active_paper():
+        return 0
+    if shadow.tracked(r):
+        shadow.record(r)
+    if not (r.startswith("paper/") and r.endswith(".tex") and not r.startswith(("paper/build/", "paper/generated/"))):
+        return 0
+    failures, notes = [], []
+    rep = bibcheck.check()
+    if rep["errors"]:
+        failures.append(bibcheck.format_report(rep, show_claims=False))
+    if r == "paper/main.tex" or "abstract" in r:
+        v = rules.abstract_violations()
+        if v:
+            failures.append(rules.format_abstract_report(v))
+    hits = rules.ai_statement_hits(core.read_text(core.path(r)))
+    if hits:
+        failures.append(f"hard rule - AI-use statement in {r}: remove it (" + "; ".join(hits[:2]) + ")")
+    mode = latex.latex_mode()
+    if mode != "off":
+        res = latex.compile_paper(strict=False, timeout=int(os.environ.get("RA_LATEX_TIMEOUT", "240")))
+        if res["status"] == "failed":
+            failures.append(latex.format_result(res))
+        elif res["status"] == "missing":
+            if mode == "strict":
+                failures.append("latexmk is not installed but RA_LATEX=strict (compilation is mandatory here).")
+            else:
+                marker = core.path(".ra", f"warned-latex-{data.get('session_id', 'x')}")
+                if not marker.exists():
+                    core.write_text(marker, core.now())
+                    notes.append("latexmk not found: compile checks are skipped on this machine until TeX is "
+                                 "installed; journal-format cannot complete without it.")
+        elif res.get("undefined"):
+            notes.append("compiled OK; still undefined: " + ", ".join(res["undefined"][:10]))
+    if failures:
+        print(f"[workspace guard] post-edit checks FAILED after editing {r} (the edit was applied; fix this next):\n"
+              + "\n".join(failures), file=sys.stderr)
+        return 2
+    if notes:
+        _context("PostToolUse", "\n".join(notes))
+    return 0
+
+
+# ================================================================== reads / searches (paper isolation)
+def pre_read(data: dict) -> int:
+    tool = data.get("tool_name") or ""
+    ti = data.get("tool_input") or {}
+    sid, cwd = data.get("session_id"), data.get("cwd")
+    if tool in ("Read", "NotebookRead"):
+        fp = ti.get("file_path") or ti.get("notebook_path")
+        if not fp:
+            return 0
+        wr, slug, _ = _locate(fp, cwd)
+        if wr and (wr == "papers" or wr.startswith("papers/")):
+            why = _paper_gate(slug, sid, wr)
+            if why:
+                return deny(why)
+        return 0
+    base = ti.get("path") or cwd or str(core.ws())
+    bwr, bslug, _ = _locate(base, cwd)
+    if bwr is None:
+        return 0
+    active = core.active_paper()
+    if bwr.startswith("papers/"):
+        why = _paper_gate(bslug, sid, bwr)
+        return deny(why) if why else 0
+    if bwr not in ("", "papers"):
+        return 0                                  # a framework folder or file
+    filt = (ti.get("pattern") if tool == "Glob" else ti.get("glob")) or ""
+    joined = (f"{bwr}/" if bwr else "") + filt.replace("\\", "/").lstrip("./")
+    if active and joined.startswith(f"papers/{active}/"):
+        why = _paper_gate(active, sid, joined)
+        return deny(why) if why else 0
+    segs = joined.split("/")
+    if tool == "Glob" and filt and (len(segs) == 1 and segs[0] != "**"
+                                    or not (segs[0] == "**" or fnmatch.fnmatch("papers", segs[0]))):
+        return 0                                  # root-level names, or a framework subtree
+    if tool == "Grep" and len(segs) > 1 and segs[0] in (".claude", "scripts", ".opencode"):
+        return 0                                  # rg globs without '/' match at any depth: require a folder
+    return deny(f"{tool} from the workspace root would search every paper's files. Scope it to "
+                f"papers/{active or '<active paper>'}/ (path=...) or to a framework folder (.claude, scripts).")
+
+
+# ================================================================== bash
+def _abs_forms(base: str) -> list[str]:
+    base = os.path.abspath(base)
+    forms = {base, base.replace("\\", "/")}
+    m = re.match(r"^([A-Za-z]):[\\/](.*)$", base)
+    if m:
+        forms.add(f"/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}")
+        forms.add(f"/mnt/{m.group(1).lower()}/{m.group(2).replace(chr(92), '/')}")
+    return sorted(forms, key=len, reverse=True)
+
+
+def _ws_relativize(cmd: str) -> str:
+    for f in _abs_forms(str(core.ws())):
+        for sep in ("/", "\\"):
+            cmd = cmd.replace(f + sep, "")
+        cmd = cmd.replace(f, ".")
+    return cmd
+
+
+def _relativize(cmd: str, active: str | None) -> str:
+    """Workspace-relative command -> paths relative to the active paper (papers/<active>/x -> x)."""
+    if active:
+        cmd = re.sub(rf"(^|[\s\"'=:(])(?:\./)?papers[/\\]{re.escape(active)}[/\\]", r"\1", cmd)
+        cmd = re.sub(rf"(^|[\s\"'=:(])(?:\./)?papers[/\\]{re.escape(active)}(?=[\s\"';|&)]|$)", r"\1.", cmd)
+    return cmd
+
+
+_B = r"(?:^|(?<=[\s\"'=:(]))(?:\./)?"
+BASH_PROTECTED = [                                # (pattern, label, framework file? -> editable in MAINTENANCE)
+    (re.compile(r"\bstate\.json\b"), "state.json", False),
+    (re.compile(r"\bproject\.json\b"), "project.json", False),
+    (re.compile(r"\.bib\b"), "BibTeX files", False),
+    (re.compile(r"references\.verified\.json"), "the citation ledger", False),
+    (re.compile(_B + r"(?:\.claude|scripts|\.opencode|\.agents)[/\\]"), "a framework directory", True),
+    (re.compile(_B + r"(?:results|\.ra|templates|feedback|exports|\.git)[/\\]"), "a protected directory", False),
+    (re.compile(r"reviews[/\\]external"), "reviews/external/", False),
+    (re.compile(r"\bCLAUDE\.md\b|\bREADME\.md\b|\bAGENTS\.md\b|\bopencode\.json\b|\bGEMINI\.md\b"), "a framework document", True),
+    (re.compile(r"\bdecisions\.md\b|\bstyle-guide\.md\b"), "a human-owned markdown file", False),
+    (re.compile(r"figures[/\\][^\s\"';|&]*\.(?:pdf|png|svg|eps|jpe?g)\b|figures[/\\]manifest\.json"), "figure outputs",
+     False),
+    (re.compile(_B + r"paper[/\\](?!build[/\\]|generated[/\\])[^\s\"';|&<>]*\.tex\b"), "paper .tex files", False),
+]
+PAPER_CREATE = re.compile(r"^\s*(?:bash\s+)?\.?/?ra\s+paper\s+new\s+(\S+)\s*$")
+WRITERS = {"cp", "mv", "rm", "truncate", "install", "ln", "chmod", "touch", "dd", "rsync", "unzip", "tar",
+           "curl", "wget", "tee", "rmdir", "shred", "patch",
+           # PowerShell cmdlets and aliases (the PowerShell tool is guarded by the same handler)
+           "move-item", "copy-item", "remove-item", "rename-item", "set-content", "add-content", "out-file",
+           "new-item", "clear-content", "expand-archive", "invoke-webrequest", "mi", "cpi", "ri", "rni", "del",
+           "erase", "move", "copy", "ren", "sc", "ac", "ni", "iwr", "tee-object"}
+INTERPRETERS = {"python", "python3", "py", "node", "ruby", "perl", "Rscript", "pwsh", "powershell"}
+WRITEISH = re.compile(r"open\(|\.write|write_text|write_bytes|unlink|remove|rename|replace\(|shutil|truncate|"
+                      r"os\.system|subprocess|Set-Content|Out-File|writeFile")
+GIT_DANGER = [
+    (r"\bgit\s+(?:-C\s+\S+\s+)?push\b", "pushing is the human's decision"),
+    (r"\bgit\s+(?:-C\s+\S+\s+)?reset\b[^;&|]*--hard", "would discard uncommitted human edits"),
+    (r"\bgit\s+(?:-C\s+\S+\s+)?(?:clean|stash)\b", "would discard human edits or untracked human input"),
+    (r"\bgit\s+(?:-C\s+\S+\s+)?restore\b", "would overwrite working-tree (possibly human) edits"),
+    (r"\bgit\s+(?:-C\s+\S+\s+)?checkout\b[^;&|]*(?:\s--(?:\s|$)|\s\.(?:\s|$))", "would overwrite working-tree edits"),
+    (r"\bgit\s+(?:-C\s+\S+\s+)?(?:filter-branch|filter-repo|rebase)\b|\bgit\s+(?:-C\s+\S+\s+)?commit\b[^;&|]*--amend",
+     "rewrites history"),
+]
+RECURSIVE_RM = re.compile(r"(?:^|\s)(?:\./)?(?:papers|paper|literature|experiments|results|figures|reviews|gates|"
+                          r"feedback|templates|exports|\.git|\.claude|scripts)(?:[/\\])?(?:\s|$)")
+AI_TRAILER = re.compile(r"co-authored-by:[^\n]*(?:claude|anthropic)|generated (?:with|by) \[?claude|"
+                        r"noreply@anthropic|\U0001F916", re.I)
+ROOTISH = {".", "./", "..", "*", "**", "./*", "*/", "papers", "papers/", "./papers", "./papers/", "papers/*"}
+SEARCHERS = {"grep", "egrep", "fgrep", "rg", "ag", "find", "tree", "du", "ls", "gci", "get-childitem", "dir",
+             "select-string", "sls"}
+
+
+def _words(seg: str) -> list[str]:
+    w = seg.strip().split()
+    while w and (re.match(r"^\w+=", w[0]) or w[0] in ("sudo", "command", "nohup", "time", "env", "exec")):
+        w = w[1:]
+    return w
+
+
+def _protected_hit(text: str, maintenance: bool = False) -> str | None:
+    for rx, label, framework in BASH_PROTECTED:
+        if rx.search(text) and not (framework and maintenance):
+            return label
+    return None
+
+
+def _root_wide(c0: str, w: list[str]) -> bool:
+    """A recursive search/listing whose scope is the whole workspace (i.e. every paper)."""
+    args = [x.strip("\"'") for x in w[1:]]
+    opts = [a for a in args if a.startswith("-")]
+    plain = [a for a in args if not a.startswith("-")]
+    if c0 in ("grep", "egrep", "fgrep"):
+        if not any(re.match(r"^-[a-zA-Z]*[rR]", o) or o in ("--recursive", "--dereference-recursive") for o in opts):
+            return False
+        paths = plain if any(o in ("-e", "-f") or o.startswith(("--regexp", "--file")) for o in opts) else plain[1:]
+    elif c0 in ("rg", "ag"):
+        paths = plain if any(o in ("-e", "-f") for o in opts) else plain[1:]
+    elif c0 == "select-string" or c0 == "sls":
+        return any(("papers" in a and "*" in a) for a in args)
+    elif c0 == "find":
+        paths = []
+        for a in args:
+            if a.startswith(("-", "(", "!")):
+                break
+            paths.append(a)
+    elif c0 in ("ls", "gci", "get-childitem", "dir"):
+        rec = any(re.match(r"^-[a-zA-Z]*R", o) or o.lower().startswith(("--recursive", "-recurse")) or
+                  (c0 != "ls" and o.lower() in ("-r", "-s")) for o in opts)
+        if not rec:
+            return False
+        paths = plain
+    else:                                          # tree, du
+        paths = plain
+    return not paths or any(p in ROOTISH or p.startswith("papers/*") for p in paths)
+
+
+def pre_bash(data: dict) -> int:
+    raw = (data.get("tool_input") or {}).get("command") or ""
+    sid = data.get("session_id")
+    active = core.active_paper()
+    if re.search(r"\bRA_(?:PAPER|WORKSPACE|GUARD_FAILOPEN|LATEX|TEX_BIN|PROJECT_DIR)\s*=|\$env:RA_", raw, re.I):
+        return deny("workspace environment overrides (RA_PAPER, RA_WORKSPACE, RA_LATEX, ...) are for the human only.")
+    if re.search(r"\bstate(?:\.py)?\s+(?:approve|reject)\b", raw):
+        return deny("gate/plan approvals are human-only. Ask the human to type `APPROVE <gate>` in chat.")
+    if re.search(r"\bpaper(?:\.py)?\s+use\b", raw):
+        return deny("switching to an existing paper is the human's decision: they type `PAPER <name>` in chat.")
+    if re.search(r"papers\.(?:create|request_switch|maintenance_on)|set_active_paper|active-paper|maintenance\.json|"
+                 r"sessions\.json", raw):
+        return deny("papers, the active paper, sessions and maintenance mode are managed only through `./ra paper` "
+                    "and the human's chat lines.")
+    creating = PAPER_CREATE.match(_ws_relativize(raw))
+    if creating:                                  # /ra-init: a NEW paper, only from a fresh conversation
+        why = papers.may_create(sid)
+        return deny(why) if why else 0
+    if re.search(r"\bpaper(?:\.py)?\s+new\b", raw):
+        return deny("create a paper with a plain `./ra paper new <name>` command (nothing else on the line).")
+    if re.search(r"\bgit\b", raw) and re.search(r"\bcommit\b", raw) and AI_TRAILER.search(raw):
+        return deny("hard rule - no AI attribution (Co-Authored-By: Claude, 'Generated with Claude', ...) in commits.")
+    norm = _ws_relativize(raw)
+    if re.search(r"papers[/\\](?:\*|\?|\[|\{)", norm):
+        return deny("globbing over papers/ would reach other papers. Name the active paper explicitly: "
+                    f"papers/{active or '<active paper>'}/...")
+    for other in core.list_papers():
+        if other != active and re.search(rf"papers[/\\]{re.escape(other)}(?:[/\\\s\"';|&)]|$)", norm):
+            return deny(f"the command touches paper '{other}', but the active paper is '{active or '(none)'}'. Papers "
+                        "are isolated: never read, search, reuse or cite another paper's files.")
+    if not active and re.search(r"papers[/\\]\w", norm):
+        return deny(core.no_paper_message())
+    scoped = False
+    segments = [s for s in re.split(r"&&|\|\||;|\||\n", norm) if s.strip()]
+    for seg in segments:
+        w = _words(seg)
+        if not w:
+            continue
+        c0 = os.path.basename(w[0]).lower().removesuffix(".exe")
+        if c0 in ("cd", "pushd", "set-location", "sl") and len(w) > 1:
+            t = w[1].strip("\"'").replace("\\", "/").lstrip("./")
+            scoped = bool(active and t.startswith(f"papers/{active}")) or t.startswith((".claude", "scripts"))
+        elif c0 in SEARCHERS and not scoped and _root_wide(c0, w):
+            return deny(f"`{seg.strip()[:60]}` searches the whole workspace (every paper). Scope it to "
+                        f"papers/{active or '<active paper>'}/ or a framework folder.")
+    harmless = re.match(r"^\s*(?:bash\s+)?\.?/?ra\s+(?:paper\s+(?:list|current)|help|doctor)\s*$", norm)
+    if active and not harmless:
+        why = papers.bind_check(sid)
+        if why:
+            return deny(why)
+    maint = bool(papers.maintenance_until(sid))
+    cmd = _relativize(norm, active)
+    for rx, why in GIT_DANGER:
+        if re.search(rx, cmd):
+            return deny(f"`{raw.strip()[:80]}`: {why}.")
+    interp = False
+    for seg in [s for s in re.split(r"&&|\|\||;|\||\n", cmd) if s.strip()]:
+        w = _words(seg)
+        if not w:
+            continue
+        c0 = os.path.basename(w[0]).lower().removesuffix(".exe")
+        is_ra = c0 == "ra" or (c0 == "bash" and len(w) > 1 and os.path.basename(w[1]) == "ra")
+        if is_ra:
+            if "py" in w[1:3]:
+                interp = True
+            continue
+        if c0 in INTERPRETERS:
+            interp = True
+        for m in re.finditer(r"(?:^|[^0-9&<>])(?:>>?|&>>?)\s*([\"']?)([^\s\"';&|]+)\1", seg):
+            hit = _protected_hit(" " + m.group(2), maint)
+            if hit:
+                return deny(f"shell redirection into {hit} (`{m.group(2)}`). Use the Edit tool or the `./ra` command.")
+        hit = _protected_hit(seg, maint)
+        if c0 in ("rm", "remove-item", "ri", "del") and re.search(r"\s-\w*[rR]|-recurse", seg, re.I) \
+                and RECURSIVE_RM.search(seg):
+            return deny("recursive delete of a workspace or paper directory.")
+        if not hit:
+            continue
+        if c0 in ("sed", "perl") and re.search(r"\s-\w*i", seg):
+            return deny(f"in-place shell edit of {hit}. Edit .tex/.md files with the Edit tool so locks and human "
+                        "edits are checked; use `./ra` for state, bibliography and results.")
+        if c0 in WRITERS:
+            return deny(f"`{c0}` on {hit}. Protected files change only via the Edit tool (checked) or `./ra` commands.")
+        if c0 == "git" and len(w) > 1 and w[1] in ("rm", "mv"):
+            return deny(f"`git {w[1]}` on {hit}.")
+    if interp:  # inline code / heredocs: judge the whole command
+        hit = _protected_hit(cmd, maint)
+        if hit and WRITEISH.search(cmd):
+            return deny(f"inline script that appears to write {hit}. Use the Edit tool or the `./ra` commands.")
+    return 0
+
+
+# ================================================================== skills
+def pre_skill(data: dict) -> int:
+    ti = data.get("tool_input") or {}
+    name = str(ti.get("skill") or ti.get("name") or ti.get("command") or "").strip().lstrip("/").split(":")[-1]
+    name = name.split()[0] if name else ""
+    if name not in STAGE_SKILLS and name != "apply-feedback":
+        return 0
+    if not core.active_paper():
+        return deny(f"skill '{name}': {core.no_paper_message()}")
+    why = papers.bind_check(data.get("session_id"))
+    if why:
+        return deny(why)
+    if name == "intake":
+        return 0
+    miss = pipeline.intake_missing()
+    if miss:
+        return deny(f"skill '{name}': intake is incomplete (missing {', '.join(miss)}). Run the intake skill: ask "
+                    "the human for these and do nothing else.")
+    if not pipeline.intake_confirmed():
+        return deny(f"skill '{name}': intake has not been confirmed by the human (gate0). Present "
+                    "gates/gate0_intake.md and wait for `APPROVE intake`.")
+    st = pipeline.load_state()
+    if name in POST_GATE1_SKILLS and not pipeline.gate_ok(st, "gate1_topic"):
+        return deny(f"skill '{name}': Gate 1 (topic) is not approved by the human.")
+    if name in POST_GATE2_SKILLS and not pipeline.gate_ok(st, "gate2_draft"):
+        return deny(f"skill '{name}': Gate 2 (draft) is not approved by the human.")
+    return 0
+
+
+# ================================================================== prompt / session / stop
+APPROVE_RE = re.compile(r"^[ \t>*_`]*(APPROVE|REJECT)[ \t]+([A-Za-z0-9_\-]+)[ \t]*[:\-–—]?[ \t]*(.*?)"
+                        r"[ \t`*_]*$", re.M)
+PAPER_RE = re.compile(r"^[ \t>*_`]*(NEW[ \t]+PAPER|PAPER)[ \t]+([A-Za-z0-9][A-Za-z0-9\-]*)[ \t`*_.]*$", re.M)
+MAINT_RE = re.compile(r"^[ \t>*_`]*MAINTENANCE[ \t]+(ON|OFF)(?:[ \t]+(\d+))?[ \t`*_.]*$", re.M)
+
+
+def prompt(data: dict) -> int:
+    text = data.get("prompt") or ""
+    sid = data.get("session_id")
+    out = []
+    for m in MAINT_RE.finditer(text):
+        if m.group(1) == "ON":
+            until = papers.maintenance_on(sid, int(m.group(2) or 120))
+            out.append(f"[workspace] MAINTENANCE ON until {until}: this conversation may edit the framework (.claude/, "
+                       "scripts/, CLAUDE.md, README.md, ra). Paper rules are unchanged. `MAINTENANCE OFF` ends it.")
+        else:
+            papers.maintenance_off()
+            out.append("[workspace] MAINTENANCE OFF: framework files are protected again.")
+    if not MAINT_RE.search(text) and papers.maintenance_until(sid):
+        out.append(f"[workspace] maintenance mode is on until {papers.maintenance_until(sid)} (framework editable).")
+    for m in PAPER_RE.finditer(text):
+        new = m.group(1).startswith("NEW")
+        slug = m.group(2).lower()
+        ok, msg = papers.request_switch(sid, slug, create_new=new)
+        out.append(f"[workspace] {'NEW PAPER' if new else 'PAPER'} {slug}: {'done' if ok else 'NOT done'} - {msg}")
+    if re.search(r"^[ \t]*PAPERS[ \t]*$", text, re.M):
+        out.append("[workspace] papers:\n" + papers.dumps_list())
+    active = core.active_paper()
+    if not active:
+        out.append("[workspace] " + core.no_paper_message() +
+                   " Ask the human which paper to work on and do nothing else until they choose.")
+        print("\n".join(out))
+        return 0
+    rec = papers.session(sid)
+    foreign = rec and rec.get("touched") and rec.get("paper") not in (None, active)
+    for m in APPROVE_RE.finditer(text):
+        verb, target, note = m.group(1), m.group(2), (m.group(3) or "").strip() or None
+        if foreign:
+            out.append(f"[workspace] {verb} {target}: NOT recorded - this conversation belongs to paper "
+                       f"'{rec['paper']}', but the active paper is '{active}'.")
+            continue
+        fn = pipeline.approve if verb == "APPROVE" else pipeline.reject
+        ok, msg = fn(target, by="human (chat)", note=note)
+        out.append(f"[workspace] {verb} {target}: {'recorded' if ok else 'NOT recorded'} - {msg}")
+    try:
+        shadow.snapshot_locks()
+    except Exception:
+        pass
+    nxt = pipeline.next_action()
+    out.append(f"[workspace] paper: {active} | next: {nxt['action']} - {nxt['detail']}")
+    if foreign:
+        out.append(f"[workspace] This conversation worked on '{rec['paper']}'. Do not act on '{active}' here: the "
+                   f"human types `PAPER {rec['paper']}` to continue it, or /clear to work on '{active}'.")
+    elif nxt["action"] == "INTAKE":
+        out.append("[workspace] Intake is mandatory: ask the human for the missing fields and do nothing else.")
+    print("\n".join(out))
+    return 0
+
+
+def session_start(data: dict) -> int:
+    papers.on_session_start(data.get("session_id"), data.get("source"))
+    active = core.active_paper()
+    lines = ["[research-agent workspace] One shared framework, one folder + git repository per paper (papers/<name>/).",
+             "This conversation works on ONE paper: never read, search, reuse or cite another paper's files, and keep "
+             "paper-specific facts out of auto-memory. A new paper starts with the human's `/ra-init` (or "
+             "`NEW PAPER <name>`); switching is the human's `PAPER <name>`.",
+             "Papers (* = active):\n" + papers.dumps_list()]
+    if not active:
+        lines.append(core.no_paper_message() + " Ask the human which paper to work on; do nothing else until then.")
+        print("\n".join(lines))
+        return 0
+    try:
+        shadow.snapshot_locks()
+    except Exception:
+        pass
+    lines += [f"ACTIVE PAPER: {active}. Its files are under papers/{active}/ (file tools); `./ra` commands act on it "
+              "and take paper-relative paths. Details: `./ra state status`.", "Pipeline status:",
+              pipeline.status_text(brief=True)]
+    if pipeline.intake_missing():
+        lines.append("INTAKE IS MANDATORY: ask the human for the target journal name, author-guidelines URL and "
+                     "article type (optionally topic, keywords, constraints). Do nothing else until they answer.")
+    lines.append("Follow CLAUDE.md. Decide what to do with `./ra state next`; run apply-feedback before every stage.")
+    print("\n".join(lines))
+    return 0
+
+
+def stop(data: dict) -> int:
+    if not core.active_paper():
+        return 0
+    v = shadow.lock_violations()
+    if not v:
+        return 0
+    if data.get("stop_hook_active"):
+        print(json.dumps({"systemMessage": "WARNING: LOCKED region(s) changed during this turn and were not "
+                                           "restored: " + "; ".join(v) + ". Please inspect with `./ra git diff`."}))
+        return 0
+    print("[workspace guard] LOCKED regions were modified during this turn (possibly by a shell command):\n  "
+          + "\n  ".join(v) + "\nRestore them exactly (see `./ra git diff`) with the Edit tool before finishing.",
+          file=sys.stderr)
+    return 2
+
+
+HANDLERS = {"pre-edit": pre_edit, "pre-read": pre_read, "post-edit": post_edit, "pre-bash": pre_bash,
+            "pre-skill": pre_skill, "prompt": prompt, "session-start": session_start, "stop": stop}
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv or argv[0] not in HANDLERS:
+        print(f"usage: ra hook <{'|'.join(HANDLERS)}>  (JSON payload on stdin)", file=sys.stderr)
+        return 1
+    event = argv[0]
+    try:
+        raw = sys.stdin.read()
+        data = json.loads(raw) if raw.strip() else {}
+    except Exception:
+        data = {}
+    try:
+        return HANDLERS[event](data)
+    except Exception:
+        tb = traceback.format_exc(limit=4)
+        if event.startswith("pre-") and os.environ.get("RA_GUARD_FAILOPEN") != "1":
+            print(f"[workspace guard] internal error; blocking to stay safe (a human can set "
+                  f"RA_GUARD_FAILOPEN=1 to bypass):\n{tb}", file=sys.stderr)
+            return 2
+        print(f"[workspace guard] internal error (non-blocking):\n{tb}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

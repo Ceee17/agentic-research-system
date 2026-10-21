@@ -1,0 +1,17 @@
+# per-paper runtime state (shadow copies of agent writes, lock snapshots)
+.ra/
+
+# LaTeX build output
+paper/build/
+*.aux
+*.fdb_latexmk
+*.fls
+*.synctex.gz
+
+# Python
+__pycache__/
+*.pyc
+
+# derived: Overleaf zip + PDFs, rebuilt by ./ra export
+exports/*
+!exports/.gitkeep

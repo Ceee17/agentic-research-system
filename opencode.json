@@ -1,0 +1,27 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // The operating manual for this workspace. OpenCode loads these files into the session
+  // automatically, alongside any AGENTS.md it discovers. CLAUDE.md is the single source of
+  // truth for the process; AGENTS.md (same folder) is the OpenCode-native entry point.
+  "instructions": ["CLAUDE.md"],
+
+  // Static safety net. The real, content-aware guardrails live in the ra-guard plugin
+  // (.opencode/plugins/ra-guard), which calls `ra hook ...` — the same engine Claude Code
+  // uses — so both harnesses enforce identical rules. These entries cover the paths and
+  // commands that must never be hand-edited or run at all, independent of the plugin.
+  "permissions": [
+    { "action": "edit", "resource": "**/state.json", "effect": "deny" },
+    { "action": "edit", "resource": "**/*.bib", "effect": "deny" },
+    { "action": "edit", "resource": "**/references.verified.json", "effect": "deny" },
+
+    { "action": "shell", "resource": "git push*", "effect": "deny" },
+    { "action": "shell", "resource": "git * push*", "effect": "deny" },
+    { "action": "shell", "resource": "git reset --hard*", "effect": "deny" },
+    { "action": "shell", "resource": "git clean*", "effect": "deny" },
+    { "action": "shell", "resource": "git stash*", "effect": "deny" },
+    { "action": "shell", "resource": "git restore*", "effect": "deny" },
+    { "action": "shell", "resource": "rm -rf *", "effect": "deny" },
+    { "action": "shell", "resource": "Remove-Item -Recurse *", "effect": "deny" }
+  ]
+}
