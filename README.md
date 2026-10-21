@@ -298,6 +298,10 @@ When sharing or publishing this framework on GitHub, you can keep your active or
 
 ---
 
-## 📜 License
+## 📜 License & Contact
 
-This framework is distributed under the MIT License. See [LICENSE](LICENSE) for details.
+Distributed under the MIT License. Copyright (c) 2026 **Jessen C.** See [LICENSE](LICENSE) for details.
+
+For research inquiries, collaborations, or questions, please contact:
+- **Author**: Jessen C.
+- **Email**: [jessen.c1706@gmail.com](mailto:jessen.c1706@gmail.com)

@@ -38,6 +38,7 @@ FRAMEWORK_PROTECTED = [
                   "papers/<paper>/experiments/, figure code in papers/<paper>/figures/scripts/."),
     ("CLAUDE.md", "process instructions are human-owned."),
     ("README.md", "workspace documentation is human-owned."),
+    ("LICENSE", "the open-source license is human-owned."),
     ("opencode.json", "the OpenCode configuration is human-owned."),
     ("AGENTS.md", "the workspace entry point is human-owned."),
     ("GEMINI.md", "the Gemini / Antigravity entry point is human-owned."),
@@ -49,7 +50,7 @@ FRAMEWORK_PROTECTED = [
     (".venv/*", "the Python environment is human-owned."),
 ]
 # what `MAINTENANCE ON` (human, chat) unlocks for one conversation; runtime state and papers stay guarded
-FRAMEWORK_EDITABLE = [".claude/*", "scripts/*", "CLAUDE.md", "README.md", "opencode.json", "AGENTS.md",
+FRAMEWORK_EDITABLE = [".claude/*", "scripts/*", "CLAUDE.md", "README.md", "LICENSE", "opencode.json", "AGENTS.md",
                       "GEMINI.md", ".opencode/*", ".agents/*", "ra", "requirements.txt", ".gitignore", ".gitattributes"]
 MAINT_HINT = (" (Human: to change the framework, type `MAINTENANCE ON` in chat; it unlocks framework files for "
               "this conversation for 2 hours, `MAINTENANCE OFF` ends it.)")
@@ -387,7 +388,7 @@ BASH_PROTECTED = [                                # (pattern, label, framework f
     (re.compile(_B + r"(?:\.claude|scripts|\.opencode|\.agents)[/\\]"), "a framework directory", True),
     (re.compile(_B + r"(?:results|\.ra|templates|feedback|exports|\.git)[/\\]"), "a protected directory", False),
     (re.compile(r"reviews[/\\]external"), "reviews/external/", False),
-    (re.compile(r"\bCLAUDE\.md\b|\bREADME\.md\b|\bAGENTS\.md\b|\bopencode\.json\b|\bGEMINI\.md\b"), "a framework document", True),
+    (re.compile(r"\bCLAUDE\.md\b|\bREADME\.md\b|\bAGENTS\.md\b|\bopencode\.json\b|\bGEMINI\.md\b|\bLICENSE\b"), "a framework document", True),
     (re.compile(r"\bdecisions\.md\b|\bstyle-guide\.md\b"), "a human-owned markdown file", False),
     (re.compile(r"figures[/\\][^\s\"';|&]*\.(?:pdf|png|svg|eps|jpe?g)\b|figures[/\\]manifest\.json"), "figure outputs",
      False),
